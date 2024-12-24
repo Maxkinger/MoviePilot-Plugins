@@ -27,13 +27,13 @@ class HdDoblyForumsSignin(_PluginBase):
     # 插件作者
     plugin_author = "cas"
     # 作者主页
-    author_url = ""
+    author_url = "https://github.com/Maxkinger"
     # 插件配置项ID前缀
     plugin_config_prefix = "hddoblyforumssignin_"
     # 加载顺序
-    plugin_order = 24
+    plugin_order = 1
     # 可使用的用户级别
-    auth_level = 2
+    auth_level = 1
 
     # 私有属性
     _enabled = False
