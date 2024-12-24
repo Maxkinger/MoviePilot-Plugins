@@ -1,3 +1,14 @@
 {
-    
+    "HdDoblyForumsSignin": {
+        "name": "杜比论坛签到",
+        "description": "杜比新论坛签到",
+        "labels": "签到",
+        "version": "0.1",
+        "icon": "hddobly.png",
+        "author": "cas",
+        "level": 1,
+        "history": {
+            "v0.1": "杜比论坛签到测试"
+        }
+    }
 }
