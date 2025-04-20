@@ -11,16 +11,5 @@
         "history": {
             "v0.1": "杜比论坛签到测试"
         }
-    },
-    "HDHiveSignin": {
-    "name": "影巢签到",
-    "description": "影巢签到自动签到，支持随机延迟",
-    "version": "1.0",
-    "icon": "https://hdhive.online/favicon.ico",
-    "author": "cas",
-    "level": 1,
-    "v2": true,
-    "history": {
-      "v1.0": "支持影巢自动签到。"
     }
 }
