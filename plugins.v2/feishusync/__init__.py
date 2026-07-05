@@ -24,7 +24,7 @@ class FeishuSync(_PluginBase):
     plugin_name = "飞书订阅同步"
     plugin_desc = "将 MoviePilot 订阅数据同步到飞书多维表格。"
     plugin_icon = "feishu.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_label = "消息通知"
     plugin_author = "Doctor"
     plugin_config_prefix = "feishusync_"
@@ -258,6 +258,53 @@ class FeishuSync(_PluginBase):
                                         "props": {
                                             "model": "send_notify",
                                             "label": "发送通知",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "delete_missing",
+                                            "label": "删除飞书多余记录",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "auto_sync_on_subscribe_change",
+                                            "label": "订阅变更自动同步",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "auto_sync_delay",
+                                            "label": "订阅变更后自动同步延迟（秒）",
+                                            "placeholder": "默认60，单位：秒，最小5",
+                                            "type": "number",
+                                            "suffix": "秒",
                                         },
                                     }
                                 ],
