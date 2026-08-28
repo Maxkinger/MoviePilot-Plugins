@@ -1,8 +1,8 @@
 import datetime
+import os
 import re
 import shutil
 import threading
-import os
 import traceback
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -15,24 +15,20 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 from app import schemas
+from app.application.history import add_transfer_fail
 from app.chain.media import MediaChain
 from app.chain.storage import StorageChain
 from app.chain.tmdb import TmdbChain
 from app.chain.transfer import TransferChain
-from app.core.config import settings
-from app.core.context import MediaInfo
-from app.core.event import eventmanager, Event
-from app.core.metainfo import MetaInfoPath
-from app.db.downloadhistory_oper import DownloadHistoryOper
-from app.db.transferhistory_oper import TransferHistoryOper
-from app.helper.directory import DirectoryHelper
-from app.log import logger
-from app.modules.filemanager import FileManagerModule
+from app.db.oper.transferhistory import TransferHistoryOper
 from app.plugins import _PluginBase
-from app.schemas import NotificationType, TransferInfo, TransferDirectoryConf
-from app.schemas.types import EventType, MediaType, SystemConfigKey
-from app.utils.string import StringUtils
-from app.utils.system import SystemUtils
+from app.sdk.config import settings
+from app.sdk.events import eventmanager, Event
+from app.sdk.logging import logger
+from app.sdk.media import MediaInfo, MetaInfoPath, resolve_media_identity
+from app.sdk.utilities import StringUtils, SystemUtils
+from app.schemas import TransferInfo, TransferDirectoryConf
+from app.schemas.types import EventType, MediaSource, MediaType, MessageType, SystemConfigKey
 
 lock = threading.Lock()
 
@@ -64,7 +60,7 @@ class CloudLinkMonitorLocal(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "2.5.10-local.2"
+    plugin_version = "3.0.0-local.1"
     # 插件作者
     plugin_author = "thsrite, local"
     # 作者主页
@@ -79,8 +75,8 @@ class CloudLinkMonitorLocal(_PluginBase):
     # 私有属性
     _scheduler = None
     transferhis = None
-    downloadhis = None
     transferchian = None
+    mediachain = None
     tmdbchain = None
     storagechain = None
     _observer = []
@@ -94,8 +90,6 @@ class CloudLinkMonitorLocal(_PluginBase):
     _softlink = False
     _strm = False
     _cron = None
-    filetransfer = None
-    mediaChain = None
     _size = 0
     # 模式 compatibility/fast
     _mode = "compatibility"
@@ -115,12 +109,10 @@ class CloudLinkMonitorLocal(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         self.transferhis = TransferHistoryOper()
-        self.downloadhis = DownloadHistoryOper()
         self.transferchian = TransferChain()
+        self.mediachain = MediaChain()
         self.tmdbchain = TmdbChain()
-        self.mediaChain = MediaChain()
         self.storagechain = StorageChain()
-        self.filetransfer = FileManagerModule()
         # 清空配置
         self._dirconf = {}
         self._transferconf = {}
@@ -324,6 +316,43 @@ class CloudLinkMonitorLocal(_PluginBase):
             logger.debug("文件%s：%s" % (text, event_path))
             self.__handle_file(event_path=event_path, mon_path=mon_path)
 
+    def _get_previous_media_title(self, mediainfo: MediaInfo) -> Optional[str]:
+        """按完整媒体身份读取已有整理标题；身份不完整时不执行降级查询。"""
+        media_source, media_id = resolve_media_identity(media=mediainfo)
+        if not media_source or not media_id:
+            return None
+        transfer_history = self.transferhis.get_by_media_identity(
+            media_source=media_source,
+            media_id=media_id,
+            mtype=mediainfo.type.value,
+        )
+        return transfer_history.title if transfer_history else None
+
+    def _get_tmdb_episodes(self, mediainfo: MediaInfo, season: int) -> Optional[List[Any]]:
+        """把完整媒体身份转换为 TMDB 身份后查询季集信息。"""
+        media_source, media_id = resolve_media_identity(media=mediainfo)
+        if not media_source or not media_id:
+            return None
+
+        tmdb_id = media_id if media_source == MediaSource.TMDB else None
+        if not tmdb_id:
+            converted = self.mediachain.convert_media_identity(
+                target_source=MediaSource.TMDB,
+                media_source=media_source,
+                media_id=media_id,
+                mtype=mediainfo.type,
+                season=season,
+            )
+            tmdb_id = converted.get("id") if converted else None
+        if not tmdb_id or not str(tmdb_id).isdigit():
+            return None
+        return self.tmdbchain.tmdb_episodes(tmdbid=int(tmdb_id), season=season)
+
+    @staticmethod
+    def _redo_hint(history_id: int) -> str:
+        """返回 V3 手动整理命令的完整媒体身份参数提示。"""
+        return f"/redo {history_id} [media_source]|[media_id]|[类型]"
+
     def __handle_file(self, event_path: str, mon_path: str):
         """
         同步一个文件
@@ -407,50 +436,47 @@ class CloudLinkMonitorLocal(_PluginBase):
                 mediainfo: MediaInfo = self.chain.recognize_media(meta=file_meta)
                 if not mediainfo:
                     logger.warn(f'未识别到媒体信息，标题：{file_meta.name}')
-                    # 新增转移成功历史记录
-                    his = self.transferhis.add_fail(
+                    # 新增转移失败历史记录
+                    his = add_transfer_fail(
                         fileitem=file_item,
                         mode=transfer_type,
-                        meta=file_meta
+                        meta=file_meta,
+                        transfer_history_oper=self.transferhis,
                     )
                     if self._notify:
                         self.post_message(
-                            mtype=NotificationType.Manual,
+                            mtype=MessageType.Manual,
                             title=f"{file_path.name} 未识别到媒体信息，无法入库！\n"
-                                  f"回复：```\n/redo {his.id} [tmdbid]|[类型]\n``` 手动识别转移。"
+                                  f"回复：```\n{self._redo_hint(his.id)}\n``` 手动识别转移。"
                         )
                     return
 
-                # 如果未开启新增已入库媒体是否跟随TMDB信息变化则根据tmdbid查询之前的title
+                # 未开启标题跟随时，沿用同一媒体身份历史中的标题。
                 if not settings.SCRAP_FOLLOW_TMDB:
-                    transfer_history = self.transferhis.get_by_type_tmdbid(tmdbid=mediainfo.tmdb_id,
-                                                                           mtype=mediainfo.type.value)
-                    if transfer_history:
-                        mediainfo.title = transfer_history.title
+                    previous_title = self._get_previous_media_title(mediainfo)
+                    if previous_title:
+                        mediainfo.title = previous_title
                 logger.info(f"{file_path.name} 识别为：{mediainfo.type.value} {mediainfo.title_year}")
 
                 # 获取集数据
                 if mediainfo.type == MediaType.TV:
-                    episodes_info = self.tmdbchain.tmdb_episodes(tmdbid=mediainfo.tmdb_id,
-                                                                 season=1 if file_meta.begin_season is None else file_meta.begin_season)
+                    episodes_info = self._get_tmdb_episodes(
+                        mediainfo=mediainfo,
+                        season=1 if file_meta.begin_season is None else file_meta.begin_season,
+                    )
                 else:
                     episodes_info = None
 
-                # 查询转移目的目录
-                target_dir = DirectoryHelper().get_dir(mediainfo, src_path=Path(mon_path))
-                if not target_dir or not target_dir.library_path or not target_dir.download_path.startswith(mon_path):
-                    target_dir = TransferDirectoryConf()
-                    target_dir.library_path = target
-                    target_dir.transfer_type = transfer_type
-                    target_dir.scraping = self._scrape
-                    target_dir.renaming = True
-                    target_dir.notify = False
-                    target_dir.overwrite_mode = self._overwrite_mode.get(mon_path) or 'never'
-                    target_dir.library_storage = "local"
-                    target_dir.library_category_folder = self._category
-                else:
-                    target_dir.transfer_type = transfer_type
-                    target_dir.scraping = self._scrape
+                # 插件目录映射是本次整理的显式目标，不依赖宿主内部目录选择实现。
+                target_dir = TransferDirectoryConf()
+                target_dir.library_path = target
+                target_dir.transfer_type = transfer_type
+                target_dir.scraping = self._scrape
+                target_dir.renaming = True
+                target_dir.notify = False
+                target_dir.overwrite_mode = self._overwrite_mode.get(mon_path) or 'never'
+                target_dir.library_storage = "local"
+                target_dir.library_category_folder = self._category
 
                 if not target_dir.library_path:
                     logger.error(f"未配置监控目录 {mon_path} 的目的目录")
@@ -471,18 +497,9 @@ class CloudLinkMonitorLocal(_PluginBase):
                     # 转移失败
                     logger.warn(f"{file_path.name} 入库失败：{transferinfo.message}")
 
-                    if self._history:
-                        # 新增转移失败历史记录
-                        self.transferhis.add_fail(
-                            fileitem=file_item,
-                            mode=transfer_type,
-                            meta=file_meta,
-                            mediainfo=mediainfo,
-                            transferinfo=transferinfo
-                        )
                     if self._notify:
                         self.post_message(
-                            mtype=NotificationType.Manual,
+                            mtype=MessageType.Manual,
                             title=f"{mediainfo.title_year}{file_meta.season_episode} 入库失败！",
                             text=f"原因：{transferinfo.message or '未知'}",
                             image=mediainfo.get_message_image()
@@ -493,21 +510,6 @@ class CloudLinkMonitorLocal(_PluginBase):
                 if transfer_type == "link":
                     self.__link_sidecar_subtitles(file_path, transferinfo)
 
-                if self._history:
-                    # 新增转移成功历史记录
-                    self.transferhis.add_success(
-                        fileitem=file_item,
-                        mode=transfer_type,
-                        meta=file_meta,
-                        mediainfo=mediainfo,
-                        transferinfo=transferinfo
-                    )
-
-                # 刮削
-                if self._scrape:
-                    self.mediaChain.scrape_metadata(fileitem=transferinfo.target_diritem,
-                                                    meta=file_meta,
-                                                    mediainfo=mediainfo)
                 """
                 {
                     "title_year season": {
@@ -668,9 +670,6 @@ class CloudLinkMonitorLocal(_PluginBase):
                 del self._medias[medis_title_year_season]
                 continue
 
-    def get_state(self) -> bool:
-        return self._enabled
-
 
     def __subtitle_language_suffix(self, source_file: Path, subtitle: Path) -> str:
         """提取字幕文件相对视频源文件的语言后缀。"""
@@ -718,6 +717,9 @@ class CloudLinkMonitorLocal(_PluginBase):
         if linked_count:
             logger.info(f"{source_file.name} 同名前缀字幕硬链接完成，共 {linked_count} 个")
 
+    def get_state(self) -> bool:
+        return self._enabled
+
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
         """
@@ -730,7 +732,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             "desc": "云盘实时监控同步",
             "category": "",
             "data": {
-                "action": "cloud_link_sync"
+                "action": "cloud_link_sync_local"
             }
         }]
 
@@ -741,6 +743,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             "methods": ["GET"],
             "summary": "云盘实时监控同步",
             "description": "云盘实时监控同步",
+            "response_model": schemas.Response[None],
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -756,7 +759,7 @@ class CloudLinkMonitorLocal(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "CloudLinkMonitor",
+                "id": "CloudLinkMonitorLocal",
                 "name": "云盘实时监控全量同步服务",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.sync_all,
@@ -764,7 +767,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             }]
         return []
 
-    def sync(self) -> schemas.Response:
+    def sync(self) -> schemas.Response[None]:
         """
         API调用目录同步
         """
