@@ -8,23 +8,24 @@ import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.config import settings
-from app.core.event import eventmanager
+from apscheduler.triggers.cron import CronTrigger
+
+from app.core.event import eventmanager, Event
+from app import schemas
 from app.log import logger
 from app.db.site_oper import SiteOper
+from app.db.subscribe_oper import SubscribeOper
 from app.plugins import _PluginBase
-from app.schemas import Event
 from app.schemas.types import EventType
-from app.utils.http import RequestUtils
 
 
 class FeishuSync(_PluginBase):
     """飞书订阅同步插件"""
 
     plugin_name = "飞书订阅同步"
-    plugin_desc = "将 MoviePilot 订阅数据同步到飞书多维表格。"
+    plugin_desc = "适配 MoviePilot V3，将 MoviePilot 订阅数据同步到飞书多维表格。"
     plugin_icon = "feishu.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.1"
     plugin_label = "消息通知"
     plugin_author = "Doctor"
     plugin_config_prefix = "feishusync_"
@@ -100,13 +101,14 @@ class FeishuSync(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """返回插件远程命令列表"""
+        """返回插件远程命令列表。"""
         return [
             {
                 "cmd": "/sync_feishu",
-                "event": "SyncFeishu",
+                "event": EventType.PluginAction,
                 "desc": "手动同步订阅数据到飞书",
-                "data": {},
+                "category": "",
+                "data": {"action": "sync_feishu"},
             }
         ]
 
@@ -114,18 +116,20 @@ class FeishuSync(_PluginBase):
         """返回插件 API 列表"""
         return [
             {
-                "path": "sync",
+                "path": "/sync",
                 "endpoint": self.api_sync,
                 "methods": ["GET", "POST"],
                 "summary": "手动触发飞书同步",
                 "description": "手动触发一次订阅数据同步到飞书",
+                "response_model": schemas.Response[dict],
             },
             {
-                "path": "status",
+                "path": "/status",
                 "endpoint": self.api_status,
                 "methods": ["GET"],
                 "summary": "查询同步状态",
                 "description": "查询最近一次同步的状态信息",
+                "response_model": schemas.Response[dict],
             },
         ]
 
@@ -455,6 +459,39 @@ class FeishuSync(_PluginBase):
                 raise Exception(f"批量更新飞书记录失败(batch_update): {result}")
             time.sleep(0.5)
 
+    @staticmethod
+    def _normalize_field_value(value: Any) -> str:
+        """规范化飞书字段值用于差异比较。"""
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "是" if value else "否"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            # 飞书文本字段可能返回 [{"text": "...", "type": "text"}] 形式的富文本片段。
+            if all(isinstance(item, dict) and "text" in item for item in value):
+                return "".join(str(item.get("text") or "") for item in value)
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, dict):
+            # 飞书文本字段在接口中有时会返回富文本片段，尽量抽取纯文本后再比较。
+            if "text" in value:
+                return str(value.get("text") or "")
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return str(value)
+
+    @classmethod
+    def _record_fields_changed(cls, local_fields: dict, remote_fields: dict) -> bool:
+        """判断本地订阅字段与飞书记录字段是否存在真实差异。"""
+        remote_fields = remote_fields or {}
+        for key, local_value in (local_fields or {}).items():
+            local_text = cls._normalize_field_value(local_value)
+            remote_text = cls._normalize_field_value(remote_fields.get(key))
+            if local_text != remote_text:
+                logger.debug(f"飞书记录字段变化：{key}，本地={local_text}，远端={remote_text}")
+                return True
+        return False
+
     def _batch_delete(self, record_ids: list) -> None:
         """批量删除记录"""
         logger.info(f"准备批量删除飞书记录: {len(record_ids)} 条")
@@ -475,22 +512,9 @@ class FeishuSync(_PluginBase):
     # ============================================================
 
     def _fetch_subscriptions(self) -> list:
-        """从 MoviePilot API 获取所有订阅数据"""
-        plugin_config = self.get_config() or {}
-        domain = plugin_config.get("moviepilot_domain") or "http://127.0.0.1:3001"
-        api_key = plugin_config.get("moviepilot_api_token") or getattr(settings, "API_TOKEN", None) or ""
-        if not api_key:
-            raise Exception("未获取到 MoviePilot API令牌，请检查系统配置")
-
-        domain = str(domain).rstrip("/")
-        url = f"{domain}/api/v1/subscribe/list?token={api_key}"
-        req = urllib.request.Request(url)
-        req.add_header("Content-Type", "application/json")
-
+        """从 MoviePilot V3 内部数据库接口获取所有订阅数据。"""
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data if isinstance(data, list) else data.get("data", [])
+            return [subscribe.to_dict() for subscribe in SubscribeOper().list() or []]
         except Exception as e:
             logger.error(f"获取订阅数据失败: {e}")
             raise
@@ -607,12 +631,12 @@ class FeishuSync(_PluginBase):
             existing_records = self._list_records()
             logger.info(f"飞书现有 {len(existing_records)} 条记录")
 
-            # 建立订阅ID→飞书record_id映射
+            # 建立订阅ID→飞书记录映射
             existing_map = {}
             for rec in existing_records:
                 sub_id = rec.get("fields", {}).get("订阅ID")
                 if sub_id is not None:
-                    existing_map[str(sub_id)] = rec["record_id"]
+                    existing_map[str(sub_id)] = rec
 
             # 分类
             to_create = []
@@ -620,10 +644,12 @@ class FeishuSync(_PluginBase):
             for rec in new_records:
                 sub_id = str(rec["fields"].get("订阅ID") or "")
                 if sub_id in existing_map:
-                    to_update.append({
-                        "record_id": existing_map[sub_id],
-                        "fields": rec["fields"],
-                    })
+                    existing_rec = existing_map[sub_id]
+                    if self._record_fields_changed(rec["fields"], existing_rec.get("fields") or {}):
+                        to_update.append({
+                            "record_id": existing_rec["record_id"],
+                            "fields": rec["fields"],
+                        })
                 else:
                     to_create.append(rec)
 
@@ -653,12 +679,14 @@ class FeishuSync(_PluginBase):
             logger.info(f"同步完成: {result_msg}")
             self._update_sync_status(now_str, result_msg)
 
-            if self._send_notify:
+            if self._send_notify and (to_create or to_update or to_delete):
                 self.post_message(
                     channel=None,
                     title="飞书订阅同步完成",
                     text=f"执行时间: {now_str}\n{result_msg}",
                 )
+            elif self._send_notify:
+                logger.info("飞书订阅同步无新增、更新或删除，跳过完成通知")
 
         except Exception as e:
             err_msg = f"同步失败: {str(e)}"
@@ -726,24 +754,34 @@ class FeishuSync(_PluginBase):
         """监听订阅完成事件并安排飞书同步。"""
         self._schedule_auto_sync("订阅已完成")
 
+
+    @eventmanager.register(EventType.PluginAction)
+    def on_plugin_action(self, event: Event) -> None:
+        """监听插件动作事件并执行手动同步。"""
+        event_data = event.event_data or {}
+        if event_data.get("action") != "sync_feishu":
+            return
+        logger.info("收到手动飞书同步命令，开始执行同步")
+        self.sync()
+
     # ============================================================
     # API 端点
     # ============================================================
 
-    def api_sync(self, **kwargs) -> dict:
-        """API: 手动触发同步"""
+    def api_sync(self, **kwargs) -> schemas.Response[dict]:
+        """API: 手动触发同步。"""
         self.sync()
-        return {"success": True, "message": "同步任务已触发"}
+        return schemas.Response(success=True, message="同步任务已触发", data={
+            "last_sync_time": self._last_sync_time,
+            "last_sync_result": self._last_sync_result,
+        })
 
-    def api_status(self, **kwargs) -> dict:
-        """API: 查询同步状态"""
-        return {
-            "success": True,
-            "data": {
-                "last_sync_time": self._last_sync_time,
-                "last_sync_result": self._last_sync_result,
-            },
-        }
+    def api_status(self, **kwargs) -> schemas.Response[dict]:
+        """API: 查询同步状态。"""
+        return schemas.Response(success=True, data={
+            "last_sync_time": self._last_sync_time,
+            "last_sync_result": self._last_sync_result,
+        })
 
     # ============================================================
     # 事件处理
@@ -757,9 +795,9 @@ class FeishuSync(_PluginBase):
             {
                 "id": "feishu_sync",
                 "name": "飞书订阅同步",
-                "trigger": "cron",
+                "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.sync,
-                "kwargs": {"cron": self._cron},
+                "kwargs": {},
             }
         ]
 
