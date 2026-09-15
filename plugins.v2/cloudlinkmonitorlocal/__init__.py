@@ -56,11 +56,11 @@ class CloudLinkMonitorLocal(_PluginBase):
     # 插件名称
     plugin_name = "目录实时监控-字幕增强版"
     # 插件描述
-    plugin_desc = "监控目录文件变化，自动转移媒体文件，并将同名前缀字幕硬链接到目标目录，字幕命名跟随视频并保留语言后缀。"
+    plugin_desc = "监控目录文件变化，自动转移媒体文件，并将同名前缀或同集数字幕硬链接到目标目录，字幕命名跟随视频并保留语言后缀。"
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.0-local.1"
+    plugin_version = "3.0.0-local.2"
     # 插件作者
     plugin_author = "thsrite, local"
     # 作者主页
@@ -88,6 +88,7 @@ class CloudLinkMonitorLocal(_PluginBase):
     _category = False
     _refresh = False
     _softlink = False
+    _subtitle_hardlink = True
     _strm = False
     _cron = None
     _size = 0
@@ -135,6 +136,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             self._cron = config.get("cron")
             self._size = config.get("size") or 0
             self._softlink = config.get("softlink")
+            self._subtitle_hardlink = config.get("subtitle_hardlink", True)
             self._strm = config.get("strm")
 
         # 停止现有任务
@@ -262,6 +264,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             "interval": self._interval,
             "history": self._history,
             "softlink": self._softlink,
+            "subtitle_hardlink": self._subtitle_hardlink,
             "cron": self._cron,
             "strm": self._strm,
             "scrape": self._scrape,
@@ -507,7 +510,7 @@ class CloudLinkMonitorLocal(_PluginBase):
                     return
 
                 # 同步硬链接同名前缀字幕文件，字幕命名跟随目标视频
-                if transfer_type == "link":
+                if self._subtitle_hardlink:
                     self.__link_sidecar_subtitles(file_path, transferinfo)
 
                 """
@@ -679,7 +682,23 @@ class CloudLinkMonitorLocal(_PluginBase):
             return ""
         if subtitle_stem.startswith(source_stem + "."):
             return subtitle_stem[len(source_stem):]
+        suffix_match = re.search(
+            r"(?i)\.((?:chs|cht|ch[st]?|zh[-_.]?(?:cn|tw|hans|hant)?|eng|en|jpn|jp|kor|kr|sc|tc|chseng|chsen|chteng|bilingual|双语|简|繁)[a-z0-9_-]*)$",
+            subtitle_stem,
+        )
+        if suffix_match:
+            return f".{suffix_match.group(1)}"
         return ""
+
+    @staticmethod
+    def __episode_key(file_path: Path) -> Optional[Tuple[int, int]]:
+        """从文件名中提取季集编号作为字幕兜底匹配键。"""
+        if not file_path:
+            return None
+        episode_match = re.search(r"[Ss](\d{1,2})[ ._-]*[Ee](\d{1,3})", file_path.stem)
+        if not episode_match:
+            return None
+        return int(episode_match.group(1)), int(episode_match.group(2))
 
     def __link_sidecar_subtitles(self, source_file: Path, transferinfo: TransferInfo) -> None:
         """将源文件同名前缀字幕硬链接到目标媒体目录，并按目标视频名重命名。"""
@@ -694,13 +713,16 @@ class CloudLinkMonitorLocal(_PluginBase):
             return
         source_dir = source_file.parent
         source_stem = source_file.stem
+        source_episode_key = self.__episode_key(source_file)
         linked_count = 0
         for subtitle in source_dir.iterdir():
             if not subtitle.is_file():
                 continue
             if subtitle.suffix.lower() not in subtitle_exts:
                 continue
-            if subtitle.stem != source_stem and not subtitle.stem.startswith(source_stem + "."):
+            same_prefix = subtitle.stem == source_stem or subtitle.stem.startswith(source_stem + ".")
+            same_episode = source_episode_key and self.__episode_key(subtitle) == source_episode_key
+            if not same_prefix and not same_episode:
                 continue
             language_suffix = self.__subtitle_language_suffix(source_file, subtitle)
             target_name = f"{target_stem}{language_suffix}{subtitle.suffix}"
@@ -715,7 +737,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             except Exception as err:
                 logger.warning(f"字幕硬链接失败：{subtitle} -> {target_subtitle}，原因：{err}")
         if linked_count:
-            logger.info(f"{source_file.name} 同名前缀字幕硬链接完成，共 {linked_count} 个")
+            logger.info(f"{source_file.name} 同名前缀/同集数字幕硬链接完成，共 {linked_count} 个")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -943,6 +965,24 @@ class CloudLinkMonitorLocal(_PluginBase):
                                                 },
                                             }
                                         ]
+                                    },
+                                    {
+                                        'component': 'VCol',
+                                        'props': {
+                                            'cols': 12,
+                                            'md': 4
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'VSwitch',
+                                                'props': {
+                                                    'model': 'subtitle_hardlink',
+                                                    'label': '字幕硬链接',
+                                                    'hint': '将源视频同名前缀字幕硬链接到入库目标目录，并按目标视频名保留语言后缀',
+                                                    'persistent-hint': True,
+                                                },
+                                            }
+                                        ]
                                     }
                                 ]
                             }
@@ -1144,6 +1184,27 @@ class CloudLinkMonitorLocal(_PluginBase):
                                 ]
                             }
                         ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '开启“字幕硬链接”后，源视频同目录下与视频同名或同名前缀的 .srt/.ass/.ssa/.sup/.vtt/.sub/.idx 字幕会硬链接到目标媒体目录；字幕文件名会跟随目标视频名，并保留 .zh-CN 等语言后缀。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 ]
             }
@@ -1156,6 +1217,7 @@ class CloudLinkMonitorLocal(_PluginBase):
             "category": False,
             "refresh": True,
             "softlink": False,
+            "subtitle_hardlink": True,
             "strm": False,
             "mode": "fast",
             "transfer_type": "filesoftlink",
