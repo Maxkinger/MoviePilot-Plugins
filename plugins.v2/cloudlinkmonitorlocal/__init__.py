@@ -60,7 +60,7 @@ class CloudLinkMonitorLocal(_PluginBase):
     # 插件图标
     plugin_icon = "Linkease_A.png"
     # 插件版本
-    plugin_version = "3.0.2"
+    plugin_version = "3.0.3"
     # 插件作者
     plugin_author = "thsrite, local"
     # 作者主页
@@ -636,6 +636,9 @@ class CloudLinkMonitorLocal(_PluginBase):
             # 判断剧集最后更新时间距现在是已超过10秒或者电影，发送消息
             if (datetime.datetime.now() - last_update_time).total_seconds() > int(self._interval) \
                     or mediainfo.type == MediaType.MOVIE:
+                self.__send_metadata_scrape_event(media_files=media_files,
+                                                  file_meta=file_meta,
+                                                  mediainfo=mediainfo)
                 # 发送通知
                 if self._notify:
 
@@ -672,6 +675,40 @@ class CloudLinkMonitorLocal(_PluginBase):
                 # 发送完消息，移出key
                 del self._medias[medis_title_year_season]
                 continue
+
+
+    def __send_metadata_scrape_event(self, media_files: List[Dict[str, Any]],
+                                     file_meta: MetaInfoPath,
+                                     mediainfo: MediaInfo) -> None:
+        """在聚合入库完成后显式触发本地元数据刮削事件。"""
+        if not self._scrape or not media_files or not mediainfo:
+            return
+
+        transferinfo = media_files[0].get("transferinfo")
+        if not transferinfo or not transferinfo.target_diritem:
+            logger.warn(f"{mediainfo.title_year} 缺少刮削目标目录，跳过显式刮削")
+            return
+
+        file_list = []
+        for media_file in media_files:
+            current_transferinfo = media_file.get("transferinfo")
+            if not current_transferinfo:
+                continue
+            for target_file in current_transferinfo.file_list_new or []:
+                if target_file and target_file not in file_list:
+                    file_list.append(target_file)
+            target_item = current_transferinfo.target_item
+            if target_item and target_item.path and str(target_item.path) not in file_list:
+                file_list.append(str(target_item.path))
+
+        logger.info(f"{mediainfo.title_year} 显式触发本地元数据刮削，文件数：{len(file_list)}")
+        self.eventmanager.send_event(EventType.MetadataScrape, {
+            "meta": file_meta,
+            "mediainfo": mediainfo,
+            "fileitem": transferinfo.target_diritem,
+            "file_list": file_list,
+            "overwrite": False,
+        })
 
 
     def __subtitle_language_suffix(self, source_file: Path, subtitle: Path) -> str:
